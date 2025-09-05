@@ -2,13 +2,22 @@ package subscribe
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/rancher/apiserver/pkg/types"
+	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
 type WatchSession struct {
@@ -110,6 +119,29 @@ func (s *WatchSession) stream(ctx context.Context, sub Subscribe, result chan<- 
 				sendErr(result, event.Error, sub)
 				continue
 			}
+			var eventType string
+			rv := event.Revision
+			tracer := noop.NewTracerProvider().Tracer("")
+			if sub.ResourceType == "configmaps" {
+				switch event.Name {
+				case types.CreateAPIEvent:
+					eventType = string(watch.Added)
+				case types.ChangeAPIEvent:
+					eventType = string(watch.Modified)
+				case types.RemoveAPIEvent:
+					eventType = string(watch.Deleted)
+				}
+				if eventType != "" {
+					tracer = otel.Tracer("", trace.WithInstrumentationAttributes(
+						attribute.String("event.type", eventType),
+						attribute.String("object.resourceVersion", rv),
+						attribute.String("object.key", event.Object.ID),
+					))
+				}
+			}
+
+			ctx := rootContextForResourceVersion(ctx, rv)
+			_, span := tracer.Start(ctx, "websocket.send")
 
 			event.ID = sub.ID
 			event.Selector = sub.Selector
@@ -122,6 +154,9 @@ func (s *WatchSession) stream(ctx context.Context, sub Subscribe, result chan<- 
 			// Give enough time for consumer to handle events, for
 			// example when many objects are in the c channel
 			case <-time.After(10 * time.Millisecond):
+				span.SetStatus(codes.Error, "timeout delivering websocket message")
+				span.End()
+				logrus.Warnf("Event took >10ms to be sent via websocket, closing stream!")
 				// handle slow consumer
 				go func() {
 					for range c {
@@ -130,10 +165,20 @@ func (s *WatchSession) stream(ctx context.Context, sub Subscribe, result chan<- 
 				}()
 				return nil
 			}
+			span.AddEvent("Websocket message sent!")
+			span.End()
 		}
 	}
 
 	return nil
+}
+
+func rootContextForResourceVersion(ctx context.Context, rv string) context.Context {
+	return trace.ContextWithRemoteSpanContext(ctx, trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceIdFromResourceVersion(rv),
+		SpanID:     spanIdFromString(os.Getenv("HOSTNAME"), "watcher"), // TODO: SHOULD BE STORE, BUT NEEDS REFACTORING
+		TraceFlags: traceFlagsForResourveVersion(rv),
+	}))
 }
 
 func NewWatchSession(apiOp *types.APIRequest, getter SchemasGetter) *WatchSession {
@@ -203,4 +248,30 @@ func sendErr(resp chan<- types.APIEvent, err error, sub Subscribe) {
 		Mode:         string(sub.Mode),
 		Error:        err,
 	}
+}
+
+func traceIdFromResourceVersion(s string) trace.TraceID {
+	var tid trace.TraceID
+	hash := md5.Sum([]byte(s))
+	copy(tid[:], hash[:])
+	return tid
+}
+
+func spanIdFromString(values ...string) trace.SpanID {
+	sum := md5.New()
+	for _, s := range values {
+		sum.Write([]byte(s))
+	}
+	hash := sum.Sum(nil)
+
+	var sid trace.SpanID
+	copy(sid[:], hash)
+	return sid
+}
+
+func traceFlagsForResourveVersion(resourceVersion string) trace.TraceFlags {
+	var flags trace.TraceFlags
+	// sample odd numbers
+	flags = flags.WithSampled(resourceVersion[len(resourceVersion)-1]%2 == 1)
+	return flags
 }
